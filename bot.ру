@@ -1,1 +1,1259 @@
+import logging
+import re
+from datetime import datetime
 
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+# =========================================================
+# НАСТРОЙКИ
+# =========================================================
+
+BOT_TOKEN = "8665963227:AAEmXn7XsEtWjMr67aBEmX0cZphOKyYUxOU"
+
+OWNER_ID = 7193319560
+ADMIN_IDS = [OWNER_ID]
+
+# =========================================================
+# ХРАНИЛИЩА
+# =========================================================
+
+users = {}
+waiting_user = None
+conversations = {}
+
+anonymous_names = {}
+banned_users = set()
+complaints = []
+
+rules_accepted = set()
+
+# =========================================================
+# ЛОГИ
+# =========================================================
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+logger = logging.getLogger(__name__)
+
+# =========================================================
+# ЗАПРЕЩЁННЫЕ СЛОВА
+# =========================================================
+
+FORBIDDEN_WORDS = [
+    "порно",
+    "порн",
+    "секс",
+    "сексик",
+    "эротик",
+    "голый",
+    "голая",
+    "голые",
+    "нюдс",
+    "нюд",
+]
+
+FORBIDDEN_PATTERN = re.compile(
+    r"(" + "|".join(map(re.escape, FORBIDDEN_WORDS)) + r")",
+    re.IGNORECASE,
+)
+
+# =========================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# =========================================================
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+def get_user_name(user_id: int) -> str:
+    if user_id not in anonymous_names:
+        anonymous_names[user_id] = f"Аноним #{user_id % 10000:04d}"
+
+    return anonymous_names[user_id]
+
+
+def main_menu_keyboard(user_id: int = None):
+    buttons = [
+        [
+            InlineKeyboardButton(
+                "🔎 Найти собеседника",
+                callback_data="find_chat"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📖 Правила",
+                callback_data="rules"
+            ),
+            InlineKeyboardButton(
+                "❓ Помощь",
+                callback_data="help"
+            )
+        ],
+    ]
+
+    # Показываем кнопку админ-панели только админам
+    if user_id and is_admin(user_id):
+        buttons.append([
+            InlineKeyboardButton(
+                "👑 Админ-панель",
+                callback_data="admin_panel"
+            )
+        ])
+
+    return InlineKeyboardMarkup(buttons)
+
+
+def admin_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "👥 Пользователи",
+                callback_data="admin_users"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🚫 Баны",
+                callback_data="admin_bans"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📢 Рассылка",
+                callback_data="admin_broadcast"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⚠️ Жалобы",
+                callback_data="admin_complaints"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📊 Статистика",
+                callback_data="admin_stats"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔙 Назад",
+                callback_data="back_to_start"
+            )
+        ],
+    ])
+
+
+def back_to_admin_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔙 Назад в админ-панель",
+                callback_data="admin_panel"
+            )
+        ]
+    ])
+
+
+def complaint_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "⚠️ Пожаловаться",
+                callback_data="complaint"
+            )
+        ]
+    ])
+
+
+async def send_main_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str = None,
+):
+    message = update.effective_message
+    user_id = update.effective_user.id
+
+    if text is None:
+        text = (
+            "👤 <b>АНОНИМНЫЙ ЧАТ</b>\n\n"
+            "Общайся с людьми анонимно.\n\n"
+            "Выбери действие ниже:"
+        )
+
+    await message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard(user_id),
+    )
+
+
+def disconnect_user(user_id: int):
+    global waiting_user
+
+    partner = conversations.pop(user_id, None)
+
+    if partner is not None:
+        conversations.pop(partner, None)
+
+    if waiting_user == user_id:
+        waiting_user = None
+
+    return partner
+
+
+# =========================================================
+# /START
+# =========================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = user.id
+
+    users.setdefault(
+        user_id,
+        {
+            "joined": datetime.now(),
+            "messages": 0,
+        }
+    )
+
+    if user_id in banned_users:
+        await update.message.reply_text(
+            "🚫 Вы заблокированы и не можете пользоваться ботом."
+        )
+        return
+
+    if user_id not in rules_accepted:
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "✅ Я принимаю правила",
+                    callback_data="accept_rules"
+                )
+            ]
+        ])
+
+        await update.message.reply_text(
+            "📖 <b>Правила анонимного чата</b>\n\n"
+            "1. Не распространяй личные данные.\n"
+            "2. Не оскорбляй других пользователей.\n"
+            "3. Не отправляй запрещённый контент.\n"
+            "4. Не угрожай другим пользователям.\n"
+            "5. За нарушение правил возможна блокировка.\n\n"
+            "Нажми кнопку ниже, чтобы продолжить.",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        return
+
+    await send_main_menu(update, context)
+
+
+# =========================================================
+# /HELP
+# =========================================================
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔙 Назад",
+                callback_data="back_to_start"
+            )
+        ]
+    ])
+
+    await update.message.reply_text(
+        "❓ <b>Помощь</b>\n\n"
+        "/start — главное меню\n"
+        "/next — следующий собеседник\n"
+        "/stop — закончить разговор\n"
+        "/help — помощь\n\n"
+        "Чтобы начать разговор, нажми "
+        "«🔎 Найти собеседника».",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+# =========================================================
+# /STOP
+# =========================================================
+
+async def stop_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user_id = update.effective_user.id
+
+    partner = disconnect_user(user_id)
+
+    if partner:
+        try:
+            await context.bot.send_message(
+                partner,
+                "❌ Собеседник завершил разговор.",
+                reply_markup=complaint_keyboard(),
+            )
+        except Exception:
+            pass
+
+        await update.message.reply_text(
+            "❌ Диалог завершён.\n\n"
+            "Собеседник отключён."
+        )
+    else:
+        await update.message.reply_text(
+            "ℹ️ Вы сейчас не находитесь в диалоге."
+        )
+
+
+# =========================================================
+# /NEXT
+# =========================================================
+
+async def next_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    global waiting_user
+
+    user_id = update.effective_user.id
+
+    if user_id in banned_users:
+        await update.message.reply_text(
+            "🚫 Вы заблокированы."
+        )
+        return
+
+    old_partner = disconnect_user(user_id)
+
+    if old_partner:
+        try:
+            await context.bot.send_message(
+                old_partner,
+                "🔄 Собеседник ищет нового человека."
+            )
+        except Exception:
+            pass
+
+    await find_partner(
+        user_id,
+        context,
+        update.message
+    )
+
+
+# =========================================================
+# ПОИСК СОБЕСЕДНИКА
+# =========================================================
+
+async def find_partner(
+    user_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    message=None,
+):
+    global waiting_user
+
+    if user_id in banned_users:
+        if message:
+            await message.reply_text(
+                "🚫 Вы заблокированы."
+            )
+        return
+
+    if user_id in conversations:
+        if message:
+            await message.reply_text(
+                "💬 Вы уже находитесь в диалоге."
+            )
+        return
+
+    if waiting_user == user_id:
+        if message:
+            await message.reply_text(
+                "🔎 Вы уже ищете собеседника..."
+            )
+        return
+
+    if waiting_user is None:
+        waiting_user = user_id
+
+        if message:
+            await message.reply_text(
+                "🔎 Ищем собеседника...\n\n"
+                "Подожди немного."
+            )
+
+        return
+
+    partner = waiting_user
+
+    if partner == user_id:
+        return
+
+    waiting_user = None
+
+    conversations[user_id] = partner
+    conversations[partner] = user_id
+
+    name1 = get_user_name(user_id)
+    name2 = get_user_name(partner)
+
+    try:
+        await context.bot.send_message(
+            partner,
+            f"💬 <b>Собеседник найден!</b>\n\n"
+            f"Вы общаетесь с {name1}.\n\n"
+            f"Чтобы завершить разговор: /stop\n"
+            f"Чтобы найти другого: /next",
+            parse_mode="HTML",
+        )
+
+        await context.bot.send_message(
+            user_id,
+            f"💬 <b>Собеседник найден!</b>\n\n"
+            f"Вы общаетесь с {name2}.\n\n"
+            f"Чтобы завершить разговор: /stop\n"
+            f"Чтобы найти другого: /next",
+            parse_mode="HTML",
+        )
+
+    except Exception as e:
+        logger.error("Ошибка соединения: %s", e)
+
+
+async def find_chat_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+
+    await find_partner(
+        user_id,
+        context,
+        query.message
+    )
+
+
+# =========================================================
+# ПРАВИЛА
+# =========================================================
+
+async def show_rules(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔙 Назад",
+                callback_data="back_to_start"
+            )
+        ]
+    ])
+
+    await query.message.edit_text(
+        "📖 <b>Правила анонимного чата</b>\n\n"
+        "1. Не распространяй личные данные.\n"
+        "2. Не оскорбляй пользователей.\n"
+        "3. Не отправляй запрещённый контент.\n"
+        "4. Не угрожай другим людям.\n"
+        "5. Не пытайся обмануть или навредить пользователям.\n"
+        "6. Администрация может заблокировать нарушителей.\n\n"
+        "Будь адекватным и уважай собеседника.",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+async def accept_rules(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    rules_accepted.add(user_id)
+
+    await query.message.delete()
+
+    await context.bot.send_message(
+        user_id,
+        "✅ Правила приняты.",
+    )
+
+    await send_main_menu(update, context)
+
+
+# =========================================================
+# ЖАЛОБЫ
+# =========================================================
+
+async def complaint_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    partner = conversations.get(user_id)
+
+    if partner is None:
+        await query.message.reply_text(
+            "❌ Невозможно пожаловаться: "
+            "собеседник уже отключён."
+        )
+        return
+
+    complaints.append({
+        "from": user_id,
+        "against": partner,
+        "reason": "Жалоба пользователя",
+        "time": datetime.now(),
+        "resolved": False,
+    })
+
+    await query.message.reply_text(
+        "✅ Жалоба отправлена администрации."
+    )
+
+
+# =========================================================
+# ПЕРЕСЫЛКА СООБЩЕНИЙ
+# =========================================================
+
+async def handle_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user = update.effective_user
+    user_id = user.id
+
+    if user_id in banned_users:
+        await update.message.reply_text(
+            "🚫 Вы заблокированы."
+        )
+        return
+
+    partner = conversations.get(user_id)
+
+    if partner is None:
+        await update.message.reply_text(
+            "ℹ️ Вы сейчас не находитесь в диалоге.\n\n"
+            "Нажми «🔎 Найти собеседника».",
+            reply_markup=main_menu_keyboard(user_id),
+        )
+        return
+
+    if update.message.text:
+        text = update.message.text
+
+        if FORBIDDEN_PATTERN.search(text):
+            complaints.append({
+                "from": user_id,
+                "against": partner,
+                "reason": "Запрещённое сообщение",
+                "time": datetime.now(),
+                "resolved": False,
+            })
+
+            await update.message.reply_text(
+                "⚠️ Сообщение не отправлено: "
+                "оно нарушает правила чата."
+            )
+            return
+
+    users.setdefault(
+        user_id,
+        {
+            "joined": datetime.now(),
+            "messages": 0,
+        }
+    )
+
+    users[user_id]["messages"] += 1
+
+    try:
+        await update.message.copy(
+            chat_id=partner
+        )
+    except Exception as e:
+        logger.error("Ошибка отправки сообщения: %s", e)
+
+
+# =========================================================
+# АДМИН-ПАНЕЛЬ
+# =========================================================
+
+async def admin_panel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+
+    if not is_admin(user_id):
+        await query.answer(
+            "⛔ Доступ запрещён.",
+            show_alert=True,
+        )
+        return
+
+    await query.message.edit_text(
+        "👑 <b>АДМИН-ПАНЕЛЬ</b>\n\n"
+        "Выбери нужный раздел:",
+        parse_mode="HTML",
+        reply_markup=admin_menu_keyboard(),
+    )
+
+
+# =========================================================
+# АДМИН — ПОЛЬЗОВАТЕЛИ
+# =========================================================
+
+async def admin_users(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    total_users = len(users)
+    online = len(conversations) // 2
+    waiting = 1 if waiting_user is not None else 0
+
+    await query.message.edit_text(
+        "👥 <b>ПОЛЬЗОВАТЕЛИ</b>\n\n"
+        f"Всего пользователей: <b>{total_users}</b>\n"
+        f"Активных диалогов: <b>{online}</b>\n"
+        f"В очереди поиска: <b>{waiting}</b>",
+        parse_mode="HTML",
+        reply_markup=back_to_admin_keyboard(),
+    )
+
+
+# =========================================================
+# АДМИН — БАНЫ
+# =========================================================
+
+async def admin_bans(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    if banned_users:
+        bans_text = "\n".join(
+            f"• <code>{uid}</code>"
+            for uid in banned_users
+        )
+    else:
+        bans_text = "Нет заблокированных пользователей."
+
+    await query.message.edit_text(
+        "🚫 <b>БАНЫ</b>\n\n"
+        f"{bans_text}\n\n"
+        "Для управления банами используй:\n"
+        "/ban ID\n"
+        "/unban ID",
+        parse_mode="HTML",
+        reply_markup=back_to_admin_keyboard(),
+    )
+
+
+# =========================================================
+# АДМИН — РАССЫЛКА
+# =========================================================
+
+async def admin_broadcast(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    await query.message.edit_text(
+        "📢 <b>РАССЫЛКА</b>\n\n"
+        "Используй команду:\n\n"
+        "<code>/broadcast текст</code>\n\n"
+        "Сообщение будет отправлено всем пользователям.",
+        parse_mode="HTML",
+        reply_markup=back_to_admin_keyboard(),
+    )
+
+
+# =========================================================
+# АДМИН — ЖАЛОБЫ
+# =========================================================
+
+async def admin_complaints(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    unresolved = [
+        c for c in complaints
+        if not c["resolved"]
+    ]
+
+    if not unresolved:
+        text = (
+            "⚠️ <b>ЖАЛОБЫ</b>\n\n"
+            "Нерешённых жалоб нет."
+        )
+    else:
+        last = unresolved[-1]
+
+        text = (
+            "⚠️ <b>ПОСЛЕДНЯЯ ЖАЛОБА</b>\n\n"
+            f"От: <code>{last['from']}</code>\n"
+            f"На: <code>{last['against']}</code>\n"
+            f"Причина: {last['reason']}\n"
+            f"Время: {last['time'].strftime('%d.%m.%Y %H:%M')}\n\n"
+            f"Всего нерешённых: <b>{len(unresolved)}</b>"
+        )
+
+    await query.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=back_to_admin_keyboard(),
+    )
+
+
+# =========================================================
+# АДМИН — СТАТИСТИКА
+# =========================================================
+
+async def admin_stats(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    total_messages = sum(
+        user.get("messages", 0)
+        for user in users.values()
+    )
+
+    active_chats = len(conversations) // 2
+
+    await query.message.edit_text(
+        "📊 <b>СТАТИСТИКА</b>\n\n"
+        f"👥 Пользователей: <b>{len(users)}</b>\n"
+        f"💬 Активных чатов: <b>{active_chats}</b>\n"
+        f"📨 Сообщений: <b>{total_messages}</b>\n"
+        f"🚫 Заблокировано: <b>{len(banned_users)}</b>\n"
+        f"⚠️ Жалоб: <b>{len(complaints)}</b>",
+        parse_mode="HTML",
+        reply_markup=back_to_admin_keyboard(),
+    )
+
+
+# =========================================================
+# /BAN
+# =========================================================
+
+async def ban_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not is_admin(update.effective_user.id):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Использование:\n"
+            "/ban ID"
+        )
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text(
+            "❌ ID должен быть числом."
+        )
+        return
+
+    if target_id == OWNER_ID:
+        await update.message.reply_text(
+            "❌ Нельзя заблокировать владельца."
+        )
+        return
+
+    banned_users.add(target_id)
+
+    partner = disconnect_user(target_id)
+
+    if partner:
+        try:
+            await context.bot.send_message(
+                partner,
+                "❌ Собеседник был отключён."
+            )
+        except Exception:
+            pass
+
+    try:
+        await context.bot.send_message(
+            target_id,
+            "🚫 Вы были заблокированы администрацией."
+        )
+    except Exception:
+        pass
+
+    await update.message.reply_text(
+        f"✅ Пользователь <code>{target_id}</code> заблокирован.",
+        parse_mode="HTML",
+    )
+
+
+# =========================================================
+# /UNBAN
+# =========================================================
+
+async def unban_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not is_admin(update.effective_user.id):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Использование:\n"
+            "/unban ID"
+        )
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text(
+            "❌ ID должен быть числом."
+        )
+        return
+
+    banned_users.discard(target_id)
+
+    await update.message.reply_text(
+        f"✅ Пользователь <code>{target_id}</code> разблокирован.",
+        parse_mode="HTML",
+    )
+
+
+# =========================================================
+# /ADDADMIN
+# =========================================================
+
+async def add_admin_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if update.effective_user.id != OWNER_ID:
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Использование:\n"
+            "/addadmin ID"
+        )
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text(
+            "❌ ID должен быть числом."
+        )
+        return
+
+    if target_id not in ADMIN_IDS:
+        ADMIN_IDS.append(target_id)
+
+    await update.message.reply_text(
+        f"✅ Пользователь <code>{target_id}</code> "
+        f"добавлен в администраторы.",
+        parse_mode="HTML",
+    )
+
+
+# =========================================================
+# /REMOVEADMIN
+# =========================================================
+
+async def remove_admin_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if update.effective_user.id != OWNER_ID:
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Использование:\n"
+            "/removeadmin ID"
+        )
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text(
+            "❌ ID должен быть числом."
+        )
+        return
+
+    if target_id == OWNER_ID:
+        await update.message.reply_text(
+            "❌ Нельзя удалить владельца из администраторов."
+        )
+        return
+
+    if target_id in ADMIN_IDS:
+        ADMIN_IDS.remove(target_id)
+
+    await update.message.reply_text(
+        f"✅ Пользователь <code>{target_id}</code> "
+        f"удалён из администраторов.",
+        parse_mode="HTML",
+    )
+
+
+# =========================================================
+# /BROADCAST
+# =========================================================
+
+async def broadcast_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not is_admin(update.effective_user.id):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Использование:\n"
+            "/broadcast текст"
+        )
+        return
+
+    text = " ".join(context.args)
+
+    success = 0
+    failed = 0
+
+    for user_id in list(users.keys()):
+        try:
+            await context.bot.send_message(
+                user_id,
+                f"📢 <b>Сообщение от администрации</b>\n\n{text}",
+                parse_mode="HTML",
+            )
+            success += 1
+        except Exception:
+            failed += 1
+
+    await update.message.reply_text(
+        "📢 <b>Рассылка завершена.</b>\n\n"
+        f"✅ Отправлено: {success}\n"
+        f"❌ Не отправлено: {failed}",
+        parse_mode="HTML",
+    )
+
+
+# =========================================================
+# /GROZA
+# =========================================================
+
+async def groza_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not is_admin(update.effective_user.id):
+        return
+
+    await update.message.reply_text(
+        "⚡ Гроза активирована."
+    )
+
+
+# =========================================================
+# CALLBACK НАЗАД
+# =========================================================
+
+async def back_to_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+
+    await query.message.edit_text(
+        "👤 <b>АНОНИМНЫЙ ЧАТ</b>\n\n"
+        "Выбери действие:",
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard(user_id),
+    )
+
+
+# =========================================================
+# ОШИБКИ
+# =========================================================
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    logger.error(
+        "Произошла ошибка:",
+        exc_info=context.error
+    )
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main():
+    if not BOT_TOKEN or BOT_TOKEN == "ВСТАВЬ_СЮДА_НОВЫЙ_ТОКЕН":
+        raise ValueError(
+            "Вставь новый токен бота в переменную BOT_TOKEN."
+        )
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    # Команды
+    application.add_handler(
+        CommandHandler("start", start)
+    )
+
+    application.add_handler(
+        CommandHandler("help", help_command)
+    )
+
+    application.add_handler(
+        CommandHandler("stop", stop_command)
+    )
+
+    application.add_handler(
+        CommandHandler("next", next_command)
+    )
+
+    application.add_handler(
+        CommandHandler("ban", ban_command)
+    )
+
+    application.add_handler(
+        CommandHandler("unban", unban_command)
+    )
+
+    application.add_handler(
+        CommandHandler("addadmin", add_admin_command)
+    )
+
+    application.add_handler(
+        CommandHandler("removeadmin", remove_admin_command)
+    )
+
+    application.add_handler(
+        CommandHandler("broadcast", broadcast_command)
+    )
+
+    application.add_handler(
+        CommandHandler("groza", groza_command)
+    )
+
+    # Главное меню
+    application.add_handler(
+        CallbackQueryHandler(
+            find_chat_callback,
+            pattern="^find_chat$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            show_rules,
+            pattern="^rules$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            help_command_callback,
+            pattern="^help$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            accept_rules,
+            pattern="^accept_rules$"
+        )
+    )
+
+    # Жалоба
+    application.add_handler(
+        CallbackQueryHandler(
+            complaint_callback,
+            pattern="^complaint$"
+        )
+    )
+
+    # Админ-панель
+    application.add_handler(
+        CallbackQueryHandler(
+            admin_panel,
+            pattern="^admin_panel$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            admin_users,
+            pattern="^admin_users$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            admin_bans,
+            pattern="^admin_bans$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            admin_broadcast,
+            pattern="^admin_broadcast$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            admin_complaints,
+            pattern="^admin_complaints$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            admin_stats,
+            pattern="^admin_stats$"
+        )
+    )
+
+    # Назад
+    application.add_handler(
+        CallbackQueryHandler(
+            back_to_start,
+            pattern="^back_to_start$"
+        )
+    )
+
+    # Все текстовые/медиа сообщения
+    application.add_handler(
+        MessageHandler(
+            filters.ALL & ~filters.COMMAND,
+            handle_message
+        )
+    )
+
+    application.add_error_handler(error_handler)
+
+    print("🤖 Бот запущен...")
+
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
+
+
+# =========================================================
+# HELP CALLBACK
+# =========================================================
+
+async def help_command_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔙 Назад",
+                callback_data="back_to_start"
+            )
+        ]
+    ])
+
+    await query.message.edit_text(
+        "❓ <b>Помощь</b>\n\n"
+        "/start — главное меню\n"
+        "/next — следующий собеседник\n"
+        "/stop — закончить разговор\n"
+        "/help — помощь\n\n"
+        "Нажми «🔙 Назад», чтобы вернуться "
+        "в главное меню.",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+if __name__ == "__main__":
+    main()
